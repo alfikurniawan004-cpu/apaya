@@ -191,15 +191,37 @@ local function trackRange(world)
     f = f and f:FindFirstChild("World " .. world)
     f = f and f:FindFirstChild("Destructable walls")
     if not f then return nil end
-    local minX, maxX = nil, nil
-    for _, d in ipairs(f:GetDescendants()) do
-        if d:IsA("BasePart") then
-            local x = d.Position.X
-            if not minX or x < minX then minX = x end
-            if not maxX or x > maxX then maxX = x end
+    -- part-nya di-stream satu-satu: abis teleport cuma stage deket spawn yang
+    -- ada, dan min X dari situ = "ujung" palsu di tengah track (kejadian
+    -- 2026-09-26: Mythic di World 5 ditolak "lewat ujung"). Ujung cuma
+    -- dipercaya kalau 4 pad win stage terakhir udah ada, start kalau
+    -- stage pertama udah ada isinya.
+    local first, firstN, last, lastN = nil, math.huge, nil, -math.huge
+    for _, s in ipairs(f:GetChildren()) do
+        local n = tonumber(s:GetAttribute("Stage"))
+        if n then
+            if n < firstN then first, firstN = s, n end
+            if n > lastN then last, lastN = s, n end
         end
     end
-    return minX, maxX
+    local endX, startX = nil, nil
+    local pads = last and last:FindFirstChild("WinPart")
+    if pads then
+        local cnt = 0
+        for _, p in ipairs(pads:GetChildren()) do
+            if p:IsA("BasePart") then
+                cnt = cnt + 1
+                if not endX or p.Position.X < endX then endX = p.Position.X end
+            end
+        end
+        if cnt < 4 then endX = nil end
+    end
+    if first then
+        for _, d in ipairs(first:GetDescendants()) do
+            if d:IsA("BasePart") and (not startX or d.Position.X > startX) then startX = d.Position.X end
+        end
+    end
+    return endX, startX
 end
 
 local function grabSword(target, world)
@@ -243,6 +265,9 @@ local function grabSword(target, world)
             repeat task.wait(0.2) until lp:GetAttribute("CurrentWorld") == world or os.clock() > deadline or not active()
             if lp:GetAttribute("CurrentWorld") ~= world then return finish(active() and "Teleport gagal" or "Sword keburu diambil") end
             task.wait(1)
+            -- minta stream sekitar sword-nya dulu (maks 5s): biar tembok/pad
+            -- buat trackRange dan part sword buat prompt udah ada
+            pcall(function() lp:RequestStreamAroundAsync(target, 5) end)
         end
 
         -- cek dulu sword-nya di jalur auto-win apa nggak, biar gak lari sia-sia:
@@ -313,12 +338,48 @@ local function grabSword(target, world)
             task.wait(0.2)
         end
         if not prompt then return finish("Prompt sword gak ketemu") end
+
+        -- prompt-nya nempel di part sword, bisa beda beberapa stud dari titik
+        -- Impact (kejadian 2026-09-26: "Gak keambil" padahal udah di titik
+        -- Impact). Deketin ke part prompt-nya sampe dalam jangkauan, tunggu
+        -- prompt-nya beneran muncul, baru tahan. Masih gagal = coba
+        -- fireproximityprompt kalau executor-nya punya.
+        local adornee = prompt.Parent
+        local function promptPos()
+            if adornee and adornee:IsA("BasePart") then return adornee.Position end
+            if adornee and adornee:IsA("Model") then return adornee:GetPivot().Position end
+            if adornee and adornee:IsA("Attachment") then return adornee.WorldPosition end
+            return target
+        end
+        local reach = math.max(2, prompt.MaxActivationDistance - 2)
+        if hum and (root.Position - promptPos()).Magnitude > reach then
+            hum:MoveTo(promptPos())
+            hum.MoveToFinished:Wait()
+        end
+        local shown, triggered = false, false
+        local c1 = prompt.PromptShown:Connect(function() shown = true end)
+        local c2 = prompt.Triggered:Connect(function() triggered = true end)
+        local t = os.clock() + 2
+        repeat task.wait(0.1) until shown or os.clock() > t
         prompt:InputHoldBegin()
         task.wait(prompt.HoldDuration + 0.25)
         prompt:InputHoldEnd()
-        local t = os.clock() + 4
+        t = os.clock() + 3
         repeat task.wait(0.2) until not active() or os.clock() > t
-        if active() then return finish("Gak keambil, coba lagi") end
+        if active() and fireproximityprompt then
+            pcall(fireproximityprompt, prompt)
+            t = os.clock() + 3
+            repeat task.wait(0.2) until not active() or os.clock() > t
+        end
+        c1:Disconnect()
+        c2:Disconnect()
+        if active() then
+            -- angka-angkanya ikut ke Telegram biar kegagalan berikutnya langsung kebaca sebabnya
+            return finish(string.format("Gak keambil (jarak %.1f, max %.0f, hold %.1fs, LOS %s, enabled %s, shown %s, triggered %s, fpp %s)",
+                (root.Position - promptPos()).Magnitude, prompt.MaxActivationDistance, prompt.HoldDuration,
+                tostring(prompt.RequiresLineOfSight), tostring(prompt.Enabled), tostring(shown), tostring(triggered),
+                tostring(fireproximityprompt ~= nil)))
+        end
         finish("Dapet!", true)
     end)
 end
