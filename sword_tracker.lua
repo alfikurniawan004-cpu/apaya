@@ -152,12 +152,16 @@ local grabOn = loadSet(GRAB_FILE, {}) -- default mati: ini aksi, bukan cuma noti
 local autoWin = remotes:WaitForChild("AutoWinRequest")
 local swordEvent = remotes:WaitForChild("SwordDropEvent")
 local swordPos = nil -- dari Impact (nyampe ke semua client); nil kalau script start pas sword udah di tanah
+local claimedBy = nil -- dari Claimed (kind, playerName, rarity, swordName): siapa yang keduluan
 local grabState = nil -- teks langkah yang lagi jalan, nil = idle
 local grabNote, grabNoteUntil = nil, 0 -- hasil terakhir, ditampilin sebentar
 
 swordEvent.OnClientEvent:Connect(function(kind, a, b)
     if kind == "Impact" and typeof(a) == "Vector3" then
         swordPos = a
+        claimedBy = nil
+    elseif kind == "Claimed" then
+        claimedBy = tostring(a)
     elseif kind == "Collected" and grabState then
         -- (kind, rarity, swordName, ...) cuma dikirim ke yang ngambil
         notifyTelegram("<b>Dapet: " .. escapeHtml(tostring(a) .. ": " .. tostring(b)) .. "</b>\nWorld "
@@ -204,13 +208,23 @@ local function grabSword(target, world)
     task.spawn(function()
         local wasOn = lp:GetAttribute("AutoWin") == true
         local deadline = os.clock() + 90
+        local label = tostring(dropState:GetAttribute("Rarity")) .. ": " .. tostring(dropState:GetAttribute("SwordName"))
         local function active() return dropState:GetAttribute("Phase") == "Active" end
         -- abis kelar: auto-win balik nyala kalau tadinya nyala ATAU mode ambil
-        -- otomatis lagi aktif (farming lanjut sampe drop berikutnya)
-        local function finish(msg)
+        -- otomatis lagi aktif (farming lanjut sampe drop berikutnya). Gagal =
+        -- kirim ke Telegram juga (yang sukses udah lewat event Collected), user
+        -- AFK gak bakal liat baris status yang cuma 4 detik.
+        local function finish(msg, success)
             setAutoWin(wasOn or next(grabOn) ~= nil)
             grabState = nil
             grabNote, grabNoteUntil = msg, os.clock() + 4
+            if not success then
+                local why = msg
+                if claimedBy and claimedBy ~= lp.Name and msg == "Sword keburu diambil" then
+                    why = why .. " sama " .. claimedBy
+                end
+                notifyTelegram("<b>Gagal ambil: " .. escapeHtml(label) .. "</b>\n" .. escapeHtml(why) .. ".\nWorld " .. world .. ".")
+            end
         end
 
         if world > (lp:GetAttribute("MaxWorldUnlocked") or 1) then
@@ -304,7 +318,8 @@ local function grabSword(target, world)
         prompt:InputHoldEnd()
         local t = os.clock() + 4
         repeat task.wait(0.2) until not active() or os.clock() > t
-        finish(active() and "Gak keambil, coba lagi" or "Dapet!")
+        if active() then return finish("Gak keambil, coba lagi") end
+        finish("Dapet!", true)
     end)
 end
 
