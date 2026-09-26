@@ -78,7 +78,9 @@ end)
 -- token/chat punya user sendiri -- jangan di-share/paste script ini ke publik.
 local TG_TOKEN = "7476184189:AAGurzPwWAm-UVlARQy2uQE7A4-0mVIpuJw"
 local TG_CHAT_ID = -1002405121033
-local TG_THREAD_ID = 7414
+local TG_THREAD_ID = 7414        -- topic utama: notif drop
+local TG_THREAD_DAPET = 201986   -- topic "INI DAPET": hasil ambil yang berhasil
+local TG_THREAD_GAGAL = 201990   -- topic "INI gak dapet": hasil ambil yang gagal
 
 -- nama fungsi HTTP-nya beda-beda tiap executor, coba yang umum dipake.
 local httpRequest = request or http_request or (syn and syn.request)
@@ -88,7 +90,8 @@ local function escapeHtml(s)
     return (s:gsub("[<>&]", { ["<"] = "&lt;", [">"] = "&gt;", ["&"] = "&amp;" }))
 end
 
-local function notifyTelegram(text)
+-- threadId opsional: default topic utama (drop), hasil ambil ke topic sendiri
+local function notifyTelegram(text, threadId)
     if not httpRequest then return end
     task.spawn(function()
         pcall(function()
@@ -98,7 +101,7 @@ local function notifyTelegram(text)
                 Headers = { ["Content-Type"] = "application/json" },
                 Body = game:GetService("HttpService"):JSONEncode({
                     chat_id = TG_CHAT_ID,
-                    message_thread_id = TG_THREAD_ID,
+                    message_thread_id = threadId or TG_THREAD_ID,
                     text = text,
                     parse_mode = "HTML",
                 }),
@@ -163,9 +166,11 @@ swordEvent.OnClientEvent:Connect(function(kind, a, b)
     elseif kind == "Claimed" then
         claimedBy = tostring(a)
     elseif kind == "Collected" and grabState then
-        -- (kind, rarity, swordName, ...) cuma dikirim ke yang ngambil
-        notifyTelegram("<b>Dapet: " .. escapeHtml(tostring(a) .. ": " .. tostring(b)) .. "</b>\nWorld "
-            .. tostring(lp:GetAttribute("CurrentWorld")) .. ", ambil otomatis.")
+        -- (kind, rarity, swordName, ...) cuma dikirim ke yang ngambil.
+        -- Penanda di awal baris pertama (yang muncul di preview notif) biar
+        -- pesan "dapet" kebaca dari jauh di antara notif drop dan gagal.
+        notifyTelegram("✅ <b>DAPET: " .. escapeHtml(tostring(a) .. ": " .. tostring(b)) .. "</b>\nWorld "
+            .. tostring(lp:GetAttribute("CurrentWorld")) .. ", ambil otomatis.", TG_THREAD_DAPET)
     end
 end)
 
@@ -245,7 +250,7 @@ local function grabSword(target, world)
                 if claimedBy and claimedBy ~= lp.Name and msg == "Sword keburu diambil" then
                     why = why .. " sama " .. claimedBy
                 end
-                notifyTelegram("<b>Gagal ambil: " .. escapeHtml(label) .. "</b>\n" .. escapeHtml(why) .. ".\nWorld " .. world .. ".")
+                notifyTelegram("❌ <b>Gagal ambil: " .. escapeHtml(label) .. "</b>\n" .. escapeHtml(why) .. ".\nWorld " .. world .. ".", TG_THREAD_GAGAL)
             end
         end
 
@@ -294,23 +299,48 @@ local function grabSword(target, world)
             -- win cuma di pinggir track sedangkan sword jatuh di tengah.
             local lead = (endX and target.X < endX + 40) and 25 or 8
             local lastX, laps = nil, 0
+            local runMin, runMax, maxStep, frames = math.huge, -math.huge, 0, 0
+            -- stat lari buat pesan gagal: ketauan karakter beneran lewat X sword
+            -- apa nggak, dan fps-nya anjlok apa nggak (kejadian 2026-09-27:
+            -- "di luar jalur" di World 4 tanpa data buat nebak sebabnya)
+            local function runInfo()
+                return string.format(" (sword X %.0f, lari X %.0f..%.0f, langkah max %.0f, %d putaran, %d frame)",
+                    target.X, runMin, runMax, maxStep, laps, frames)
+            end
+            local hit = false
             repeat
-                task.wait() -- tiap frame: 100 stud/s = ~1.7 stud/frame, jendela pasti kena
+                task.wait()
                 local c = lp.Character
                 root = c and c:FindFirstChild("HumanoidRootPart")
                 if not active() then return finish("Sword keburu diambil") end
-                if os.clock() > deadline then return finish("Kelamaan, batal") end
+                if os.clock() > deadline then return finish("Kelamaan, batal" .. runInfo()) end
                 if root then
-                    -- lompat balik ke start = satu putaran. Satu putaran wajar (mulai
-                    -- dari posisi yang udah lewat sword-nya); dua putaran tanpa pernah
-                    -- kena jendela = sword di luar jalur auto-win, jangan muter terus.
-                    if lastX and root.Position.X - lastX > 300 then laps = laps + 1 end
-                    lastX = root.Position.X
-                    if laps >= 2 then return finish("Sword di luar jalur auto-win") end
+                    local x = root.Position.X
+                    frames = frames + 1
+                    if x < runMin then runMin = x end
+                    if x > runMax then runMax = x end
+                    -- frame pertama udah pas di sebelah sword (mis. jatuh deket start)
+                    if not lastX and math.abs(x - target.X) <= 8 then hit = true end
+                    if lastX then
+                        local step = x - lastX
+                        -- lompat balik ke start = satu putaran. Satu putaran wajar (mulai
+                        -- dari posisi yang udah lewat sword-nya); dua putaran tanpa pernah
+                        -- kena = sword di luar jalur auto-win, jangan muter terus.
+                        if step > 300 then
+                            laps = laps + 1
+                        else
+                            if math.abs(step) > maxStep then maxStep = math.abs(step) end
+                            -- deteksi LINTASAN antar frame, bukan nunggu frame pas di dalam
+                            -- jendela: frame lalu masih > sword+lead, frame ini udah <= itu.
+                            -- Tahan fps anjlok (100 stud/s, satu frame bisa loncat >16 stud).
+                            local dxPrev, dx = lastX - target.X, x - target.X
+                            if dxPrev > lead and dx <= lead then hit = true end
+                        end
+                    end
+                    lastX = x
+                    if laps >= 2 then return finish("Sword di luar jalur auto-win" .. runInfo()) end
                 end
-                -- jendela [sword-8, sword+lead]: dateng dari arah +X, jadi berhenti
-                -- begitu masuk jarak lead; udah lewat jauh = tunggu putaran berikutnya
-            until root and root.Position.X - target.X <= lead and root.Position.X - target.X >= -8
+            until hit
             setAutoWin(false)
         end
 
@@ -324,7 +354,10 @@ local function grabSword(target, world)
         -- keburu reset ke start, jangan nabrak tembok pake MoveTo. Kasus di
         -- belakang start boleh lebih jauh, dari spawn ke situ gak ada tembok.
         local gapLeft = (root.Position - target).Magnitude
-        if gapLeft > (walkOnly and 150 or 40) then return finish("Auto-win keburu reset, sword kelewat") end
+        -- 60, bukan 40: deteksi lintasan bisa kelewat satu frame pas fps anjlok
+        if gapLeft > (walkOnly and 150 or 60) then
+            return finish(string.format("Auto-win keburu reset, sword kelewat (jarak %.0f)", gapLeft))
+        end
         local hum = c:FindFirstChildOfClass("Humanoid")
         if hum and gapLeft > 6 then
             hum:MoveTo(target)
