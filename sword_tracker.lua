@@ -281,6 +281,11 @@ local function moveToTimed(hum, pos, timeout, abortFn)
     until done or aborted or os.clock() > t or not hum.Parent or hum.Health <= 0
     conn:Disconnect()
     if aborted and hum.RootPart then hum:MoveTo(hum.RootPart.Position) end
+    if done then return "nyampe" end
+    if aborted then return "stop" end
+    if jumps > 6 then return "mentok" end
+    if not hum.Parent or hum.Health <= 0 then return "mati" end
+    return "timeout"
 end
 
 -- Jalan pake PathfindingService: ngelewatin tangga/undakan/lompatan. MoveTo
@@ -288,9 +293,10 @@ end
 -- x8.86B/x7.68B lantainya lebih tinggi). Rute gak ketemu = jalan lurus.
 -- reached() opsional: berhenti begitu udah nyampe (mis. masuk zona toko).
 local PathfindingService = game:GetService("PathfindingService")
+-- Balikin alasan berhentinya (teks pendek) buat laporan gagal di Telegram.
 local function walkTo(hum, pos, abortFn, reached)
     local root = hum.RootPart
-    if not root then return end
+    if not root then return "gak ada RootPart" end
     local function stop() return (abortFn ~= nil and abortFn()) or (reached ~= nil and reached()) end
     local path = PathfindingService:CreatePath({ AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 4 })
     local ok = pcall(function() path:ComputeAsync(root.Position, pos) end)
@@ -299,22 +305,24 @@ local function walkTo(hum, pos, abortFn, reached)
         -- nunggu timeout satu-satu, bisa menitan (kejadian 2026-09-27 "Jalan ke
         -- pad x8.1B..." nyangkut). Meleset 2 titik berturut / lewat 25s = nyerah,
         -- biar pemanggilnya nyoba cara lain.
+        local wps = path:GetWaypoints()
         local misses, tEnd = 0, os.clock() + 25
-        for _, wp in ipairs(path:GetWaypoints()) do
-            if stop() or not hum.Parent or os.clock() > tEnd then return end
+        for i, wp in ipairs(wps) do
+            if stop() or not hum.Parent then return "stop" end
+            if os.clock() > tEnd then return "rute " .. #wps .. " titik, lewat 25s di titik " .. i end
             if wp.Action == Enum.PathWaypointAction.Jump then hum.Jump = true end
-            moveToTimed(hum, wp.Position, 3, stop)
+            local r = moveToTimed(hum, wp.Position, 3, stop)
             local rp = hum.RootPart
             if rp and (rp.Position - wp.Position).Magnitude > 6 then
                 misses = misses + 1
-                if misses >= 2 then return end
+                if misses >= 2 then return "rute " .. #wps .. " titik, nyangkut di titik " .. i .. " (" .. r .. ")" end
             else
                 misses = 0
             end
         end
-        return
+        return "rute " .. #wps .. " titik abis"
     end
-    moveToTimed(hum, pos, 9, stop)
+    return "gak ada rute (" .. (ok and path.Status.Name or "error") .. "), lurus " .. moveToTimed(hum, pos, 9, stop)
 end
 
 local function setAutoWin(on)
@@ -1102,15 +1110,33 @@ local function buyWanted(window)
     local root = c and c:FindFirstChild("HumanoidRootPart")
     if not (hum and root) then return fail("Karakter gak ada") end
     -- tujuan = bawah zona + 3 (tengah part bisa di dalem meja toko, pathfinding
-    -- gak bisa nyari rute ke dalem benda); berhenti begitu masuk zona
+    -- gak bisa nyari rute ke dalem benda); berhenti begitu masuk zona.
+    -- Gantian pathfinding / MoveTo lurus: 4x lurus pernah nyampe toko
+    -- (2026-09-27); abis diganti walkTo doang, 2x "Gak nyampe" di jarak ~133
+    -- (2026-09-30) -- walkTo cuma jalan lurus kalo rute GAK ketemu.
     local goal = Vector3.new(z.Position.X, z.Position.Y - z.Size.Y / 2 + 3, z.Position.Z)
-    for _ = 1, 4 do
+    local startDist = (root.Position - z.Position).Magnitude
+    local legs = {}
+    for leg = 1, 4 do
         if inShop(z) or busy() then break end
-        walkTo(hum, goal, busy, function() return inShop(z) end)
+        local why
+        if leg % 2 == 1 then
+            why = walkTo(hum, goal, busy, function() return inShop(z) end)
+        else
+            local r = moveToTimed(hum, goal, 9, function() return busy() or inShop(z) end)
+            why = "lurus " .. tostring(r)
+        end
+        table.insert(legs, leg .. ": " .. tostring(why))
     end
     if busy() then return done("retry") end
     if not inShop(z) then
-        return fail(string.format("Gak nyampe Charm Shop (jarak %.0f)", (root.Position - z.Position).Magnitude))
+        -- awal ~= jarak -> karakter gak gerak sama sekali (kekunci);
+        -- awal >> jarak -> gerak tapi nyangkut (rute/geometri)
+        return fail(string.format(
+            "Gak nyampe Charm Shop (jarak %.0f, awal %.0f, tinggi %.0f). %s. WalkSpeed %s, Sit %s, Anchored %s, AFKPad %s, AutoWin %s",
+            (root.Position - z.Position).Magnitude, startDist, root.Position.Y - goal.Y, table.concat(legs, "; "),
+            tostring(hum.WalkSpeed), tostring(hum.Sit), tostring(root.Anchored), tostring((afkPad())),
+            tostring((lp:GetAttribute("AutoWin")))))
     end
 
     charmState = "Beli charm..."
